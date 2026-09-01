@@ -157,21 +157,19 @@ for L in $VPU_LISTS; do
 done
 echo "   VPU files copied: $VPU_COPIED"
 
-echo ">> [graft] VIP/NPU userspace and YOLOv5 demo"
-# Keep this aligned with the NPU-only tarball: the HAL is the runtime entry
-# point and /opt/yolov5 contains the demo, models, and any bundled helpers.
+# The VIP/NPU userspace and YOLOv5 demo are supplied by the Orange Pi image,
+# not the Radxa KDE image. The output started as a clone of that image, so
+# retain the files in place and verify that the source image really has them.
+echo ">> [check] VIP/NPU userspace and YOLOv5 demo from Orange Pi"
 for npu_path in /usr/lib/libVIPhal.so /opt/yolov5; do
-  npu_src="/mnt/radxa$npu_path"
+  npu_src="/mnt/out$npu_path"
   if [ ! -e "$npu_src" ] && [ ! -L "$npu_src" ]; then
-    echo "ERROR: required NPU path is missing from Radxa image: $npu_path" >&2
+    echo "ERROR: required NPU path is missing from Orange Pi image: $npu_path" >&2
     echo "       This image does not contain the expected VIP/YOLOv5 demo." >&2
     exit 1
   fi
-  mkdir -p "/mnt/out$(dirname "$npu_path")"
-  # Follow source-image symlinks so the HAL remains self-contained on OPi.
-  cp -aL "$npu_src" "/mnt/out$npu_path"
 done
-echo "   NPU paths copied: /usr/lib/libVIPhal.so /opt/yolov5"
+echo "   NPU paths present: /usr/lib/libVIPhal.so /opt/yolov5"
 
 echo ">> [graft] Patching gstomx.conf"
 

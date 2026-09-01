@@ -1,10 +1,12 @@
 #!/bin/bash
-# Build PowerVR and Cedar userspace tarballs from a Radxa A7S image.
+# Build PowerVR/Cedar userspace tarballs from Radxa and NPU userspace from an
+# Orange Pi image.
 #
 # Run in a privileged debian:bookworm-slim container with this repository
 # mounted at /work.
 #
-# Input: /work/radxa-a733_bullseye_kde_r2.output_512.img
+# Inputs: /work/radxa-a733_bullseye_kde_r2.output_512.img and
+#         /work/Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
 # Output: /work/pvr-userspace.tar.gz, /work/vpu-userspace.tar.gz, and
 #         /work/npu-userspace.tar.gz
 #
@@ -14,11 +16,18 @@
 set -euo pipefail
 
 RADXA_IMG=/work/radxa-a733_bullseye_kde_r2.output_512.img
+OPI_IMG=/work/Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
 
 if [ ! -f "$RADXA_IMG" ]; then
   echo "ERROR: $RADXA_IMG not found" >&2
   echo "Download the Radxa A7S Bullseye KDE image" >&2
   echo "and place it (uncompressed) at $RADXA_IMG." >&2
+  exit 1
+fi
+
+if [ ! -f "$OPI_IMG" ]; then
+  echo "ERROR: $OPI_IMG not found" >&2
+  echo "The NPU userspace is extracted from the Orange Pi image." >&2
   exit 1
 fi
 
@@ -30,14 +39,25 @@ read -r RADXA_START RADXA_SECTORS < <(partx -g -b -o START,SECTORS -r --nr 3 "$R
 RADXA_PART_OFFSET=$((RADXA_START * 512))
 RADXA_PART_SIZE=$((RADXA_SECTORS * 512))
 
+read -r OPI_START _ < <(partx -g -b -o START,SECTORS -r --nr 1 "$OPI_IMG")
+: "${OPI_START:?could not read Orange Pi partition 1 from $OPI_IMG}"
+OPI_PART_OFFSET=$((OPI_START * 512))
+
+LOOP=
+OPI_LOOP=
 LOOP=$(losetup -o $RADXA_PART_OFFSET --sizelimit $RADXA_PART_SIZE -f --show "$RADXA_IMG")
+OPI_LOOP=$(losetup -o $OPI_PART_OFFSET -f --show "$OPI_IMG")
 
 mkdir -p /mnt/radxa
 mount -o ro "$LOOP" /mnt/radxa
+mkdir -p /mnt/opi
+mount -o ro "$OPI_LOOP" /mnt/opi
 
 cleanup() {
   umount -l /mnt/radxa 2>/dev/null || true
-  losetup -d "$LOOP" 2>/dev/null || true
+  umount -l /mnt/opi 2>/dev/null || true
+  [ -z "$LOOP" ] || losetup -d "$LOOP" 2>/dev/null || true
+  [ -z "$OPI_LOOP" ] || losetup -d "$OPI_LOOP" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -145,13 +165,14 @@ tar -C "$VPU_STAGE" -czf /work/vpu-userspace.tar.gz .
 echo "   vpu: $VPU_COPIED files; tarball: $(du -h /work/vpu-userspace.tar.gz | cut -f1)"
 
 
-# NPU userspace + demo
+# NPU userspace + demo. The Radxa KDE image does not contain this payload;
+# these files come from the Orange Pi image.
 echo ">> Building npu-userspace.tar.gz"
 NPU_STAGE=/tmp/npu-stage
 rm -rf "$NPU_STAGE"; mkdir -p "$NPU_STAGE"
 
 # libVIPhal.so is the VIP/NPU userspace HAL. The YOLOv5 tree is the demo that
-# ships with the Radxa userspace image. Keep this list deliberately small: it
+# ships with the Orange Pi image. Keep this list deliberately small: it
 # mirrors the useful part of the manual extraction command and avoids copying
 # the source image's unrelated applications and development files.
 NPU_PATHS="
@@ -160,9 +181,9 @@ NPU_PATHS="
 "
 NPU_COPIED=0
 for path in $NPU_PATHS; do
-  src="/mnt/radxa$path"
+  src="/mnt/opi$path"
   if [ ! -e "$src" ] && [ ! -L "$src" ]; then
-    echo "ERROR: required NPU path is missing from Radxa image: $path" >&2
+    echo "ERROR: required NPU path is missing from Orange Pi image: $path" >&2
     echo "       This image does not contain the expected VIP/YOLOv5 demo." >&2
     exit 1
   fi
