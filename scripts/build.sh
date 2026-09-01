@@ -1,10 +1,10 @@
 #!/bin/bash
-# Build an Orange Pi Zero 3W image with Radxa's A733 GPU/VPU userspace.
+# Build an Orange Pi Zero 3W image with Radxa's A733 GPU/VPU/NPU userspace.
 #
 # Run this in a privileged debian:bookworm-slim container with the repository
 # mounted at /work. The two source images must be placed in /work first.
 #
-# Output: /work/hybrid-opi66-with-radxa-gpu-vpu.img
+# Output: /work/hybrid-opi66-with-radxa-gpu-vpu-npu.img
 #
 # No proprietary binaries are stored in this repository. This script only copies
 # files from the Radxa image supplied by the user.
@@ -13,7 +13,7 @@ set -euo pipefail
 
 OPI_IMG=/work/Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
 RADXA_IMG=/work/radxa-a733_bullseye_kde_r2.output_512.img
-OUT_IMG=/work/hybrid-opi66-with-radxa-gpu-vpu.img
+OUT_IMG=/work/hybrid-opi66-with-radxa-gpu-vpu-npu.img
 
 RADXA_KVER=5.15.147-14-a733
 OPI_KVER=6.6.98-sun60iw2
@@ -156,6 +156,22 @@ for L in $VPU_LISTS; do
   done < "$L"
 done
 echo "   VPU files copied: $VPU_COPIED"
+
+echo ">> [graft] VIP/NPU userspace and YOLOv5 demo"
+# Keep this aligned with the NPU-only tarball: the HAL is the runtime entry
+# point and /opt/yolov5 contains the demo, models, and any bundled helpers.
+for npu_path in /usr/lib/libVIPhal.so /opt/yolov5; do
+  npu_src="/mnt/radxa$npu_path"
+  if [ ! -e "$npu_src" ] && [ ! -L "$npu_src" ]; then
+    echo "ERROR: required NPU path is missing from Radxa image: $npu_path" >&2
+    echo "       This image does not contain the expected VIP/YOLOv5 demo." >&2
+    exit 1
+  fi
+  mkdir -p "/mnt/out$(dirname "$npu_path")"
+  # Follow source-image symlinks so the HAL remains self-contained on OPi.
+  cp -aL "$npu_src" "/mnt/out$npu_path"
+done
+echo "   NPU paths copied: /usr/lib/libVIPhal.so /opt/yolov5"
 
 echo ">> [graft] Patching gstomx.conf"
 

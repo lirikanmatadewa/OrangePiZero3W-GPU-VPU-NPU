@@ -1,10 +1,10 @@
-# Orange Pi Zero 3W GPU/VPU image builder
+# Orange Pi Zero 3W GPU/VPU/NPU image builder
 
-The Orange Pi Zero 3W's Allwinner A733 has an Imagination PowerVR BXM-4-64 GPU and an Allwinner Cedar video engine, but Orange Pi's stock images ship no userspace for either, leaving them unusable. Radxa's Cubie A7S uses the same A733 silicon and ships the missing PowerVR and Cedar userspace in its Debian image.
+The Orange Pi Zero 3W's Allwinner A733 has an Imagination PowerVR BXM-4-64 GPU, an Allwinner Cedar video engine, and a VIP/NPU accelerator. Orange Pi's stock image ships without the userspace needed to use these accelerators. Radxa's Cubie A7S uses the same A733 silicon and ships compatible PowerVR, Cedar, and VIP userspace in its Debian image.
 
-These scripts build an Orange Pi Zero 3W Ubuntu image with a working GPU and VPU by grafting that userspace out of a Radxa image you supply locally, then rebuilding the PowerVR kernel module against Orange Pi's kernel with DKMS. The bootloader, kernel, DTB, Wi-Fi, Bluetooth, desktop, and default user all stay exactly as Orange Pi shipped them.
+These scripts build an Orange Pi Zero 3W Ubuntu image with working GPU, VPU, and NPU userspace by grafting it out of a Radxa image you supply locally, then rebuilding the PowerVR kernel module against Orange Pi's kernel with DKMS. The bootloader, kernel, DTB, Wi-Fi, Bluetooth, desktop, and default user all stay exactly as Orange Pi shipped them.
 
-No proprietary binaries live in this repository. The GPU/VPU files come straight out of the Radxa image on your own machine at build time. There's a longer write-up in [this XDA article](https://www.xda-developers.com/orange-pi-zero-3w-beats-raspberry-pi-5-cant-use-half-hardware/).
+No proprietary binaries live in this repository. The GPU/VPU/NPU files come straight out of the Radxa image on your own machine at build time. There's a longer write-up in [this XDA article](https://www.xda-developers.com/orange-pi-zero-3w-beats-raspberry-pi-5-cant-use-half-hardware/).
 
 ## What works
 
@@ -13,9 +13,16 @@ On the tested image pair, the result has:
 - PowerVR Vulkan/OpenGL ES/OpenCL userspace
 - `pvrsrvkm` rebuilt for Orange Pi's `6.6.98-sun60iw2` kernel, with PowerVR firmware and the Vulkan ICD in place
 - Allwinner CedarC/libcedarc userspace
+- VIP/NPU userspace (`libVIPhal.so`) and the Radxa `/opt/yolov5` demo tree
 - Hardware video decode/encode through GStreamer's OMX plugins
 - Hardware-accelerated WebGL/WebGPU in Chromium via ANGLE-on-Vulkan, installed from the saiarcot895 PPA (Ubuntu's repository `chromium-browser` is only a Snap transition package that's unsuitable for this userspace). Two test launchers are added to the desktop. The first is a WebGL aquarium and the second is a `chrome://gpu` shortcut
 - Orange Pi's original bootloader, kernel, DTB, Wi-Fi, Bluetooth, desktop, and default user are all untouched
+
+The NPU portion is userspace integration: the image builder copies the VIP HAL
+and the demo tree from the Radxa image into the Orange Pi root filesystem. It
+does not replace the Orange Pi kernel or claim that every NPU application is
+supported. The included YOLOv5 demo is the reference application for checking
+the supplied NPU userspace.
 
 ## Source images
 
@@ -39,7 +46,7 @@ shasum -a 256 Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
 shasum -a 256 radxa-a733_bullseye_kde_r2.output_512.img.xz
 ```
 
-I only tested this exact image pair. The scripts read partition offsets from each image's own partition table, but the package names and paths are hardcoded to those two BSP images, so a different or newer image may need small path/package-name fixes. When an input doesn't match, the scripts fail at the missing file rather than producing a broken image.
+I only tested this exact image pair. The scripts read partition offsets from each image's own partition table, but the package names and paths are hardcoded to those two BSP images, including `/usr/lib/libVIPhal.so` and `/opt/yolov5` for NPU support. A different or newer image may need small path/package-name fixes. When an input doesn't match, the scripts fail at the missing file rather than producing a broken image.
 
 ## Build a flashable image
 
@@ -50,7 +57,7 @@ docker run --rm --privileged -v "$(pwd):/work" -w /work \
   debian:bookworm-slim bash /work/scripts/build.sh
 ```
 
-The output is `hybrid-opi66-with-radxa-gpu-vpu.img`. Flash it with your usual imaging tool, or with `dd`.
+The output is `hybrid-opi66-with-radxa-gpu-vpu-npu.img`. Flash it with your usual imaging tool, or with `dd`.
 
 To rebuild the PowerVR module, `build.sh` runs DKMS against the kernel headers the stock Orange Pi image already ships at `/opt/linux-headers-current-sun60iw2_*.deb`. The build depends on that `.deb` being present there; the pinned image carries it.
 
@@ -59,7 +66,7 @@ macOS:
 ```bash
 diskutil list
 sudo diskutil unmountDisk /dev/diskN
-sudo dd if=hybrid-opi66-with-radxa-gpu-vpu.img of=/dev/rdiskN bs=4m status=progress
+sudo dd if=hybrid-opi66-with-radxa-gpu-vpu-npu.img of=/dev/rdiskN bs=4m status=progress
 sudo diskutil eject /dev/diskN
 ```
 
@@ -74,22 +81,77 @@ docker run --rm --privileged -v "$(pwd):/work" -w /work \
   debian:bookworm-slim bash /work/scripts/make-tarball.sh
 ```
 
-That produces `pvr-userspace.tar.gz` and `vpu-userspace.tar.gz`. Copy them to the board and extract as root:
+That produces three independent bundles:
+
+- `pvr-userspace.tar.gz`: PowerVR userspace and firmware files
+- `vpu-userspace.tar.gz`: Cedar/libcedarc and GStreamer OMX files
+- `npu-userspace.tar.gz`: the VIP/NPU HAL (`/usr/lib/libVIPhal.so`) and Radxa's `/opt/yolov5` demo tree
+
+Copy the bundles you need to the board and extract them as root. For the full
+GPU/VPU/NPU setup:
 
 ```bash
 sudo tar xzpf /tmp/pvr-userspace.tar.gz -C /
 sudo tar xzpf /tmp/vpu-userspace.tar.gz -C /
+sudo tar --dereference --xattrs --numeric-owner -xzpf /tmp/npu-userspace.tar.gz -C /
 sudo ldconfig
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo reboot
 ```
 
+After reboot, confirm that the HAL is visible and run the demo from the
+extracted tree. The exact entry point can vary between Radxa image revisions;
+list the supplied files first:
+
+```bash
+ls -l /usr/lib/libVIPhal.so
+find /opt/yolov5 -maxdepth 2 -type f -perm /111 -print
+cd /opt/yolov5
+```
+
+The NPU tarball contains the following paths from the source image, with
+archive metadata preserved:
+
+```bash
+sudo tar --dereference --xattrs --numeric-owner -czf npu-userspace.tar.gz \
+  /usr/lib/libVIPhal.so \
+  /opt/yolov5
+```
+
+The demo may still require the Python packages and model assets expected by
+the particular Radxa image. Those are intentionally kept inside `/opt/yolov5`
+when present, but are not downloaded by this repository. If the HAL or demo
+tree is absent from the source image, both the full image build and the NPU
+tarball build stop with an error.
+
 This does not build the PowerVR kernel module. Use the full image builder if you want DKMS handled for you.
+
+### Armbian and newer Debian/Ubuntu images
+
+The exported tarballs are intended to be portable userspace bundles. They can
+also be used on compatible Armbian images and on newer Debian or Ubuntu images
+for the Orange Pi Zero 3W, instead of flashing the pinned Jammy image used by
+the full builder. Install only the bundles you need; the NPU bundle is
+independent of the GPU and VPU bundles.
+
+The target image must still provide a compatible A733 kernel and device-tree
+support. The tarballs do not install or build a kernel, bootloader, device
+tree, or kernel modules. In particular, the full GPU setup needs the
+`pvrsrvkm` module built for the target kernel, and VPU/NPU applications need
+the corresponding kernel device drivers and device nodes. Userspace library
+compatibility can also depend on the target distribution's loader and system
+libraries, so test on the specific Armbian or Debian/Ubuntu release in use.
+
+After installing a bundle, run `ldconfig`, reload udev, reboot, and verify the
+accelerator before relying on it in an application. The NPU bundle's supplied
+`/opt/yolov5` tree is the reference test application, but its Python
+dependencies and model assets may need to be installed separately on the
+target distribution.
 
 ## Scripts
 
 - `scripts/build.sh`: builds the full hybrid image
-- `scripts/make-tarball.sh`: pulls the PowerVR/VPU userspace tarballs from the Radxa image
+- `scripts/make-tarball.sh`: pulls the PowerVR, VPU, and NPU userspace tarballs from the Radxa image
 
 ## License and redistribution
 

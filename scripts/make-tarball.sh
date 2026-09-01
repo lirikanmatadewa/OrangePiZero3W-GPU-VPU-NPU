@@ -5,7 +5,8 @@
 # mounted at /work.
 #
 # Input: /work/radxa-a733_bullseye_kde_r2.output_512.img
-# Output: /work/pvr-userspace.tar.gz and /work/vpu-userspace.tar.gz
+# Output: /work/pvr-userspace.tar.gz, /work/vpu-userspace.tar.gz, and
+#         /work/npu-userspace.tar.gz
 #
 # No proprietary binaries are stored in this repository. The tarballs are built
 # locally from the Radxa image supplied by the user.
@@ -143,15 +144,50 @@ rm -f /work/vpu-userspace.tar.gz
 tar -C "$VPU_STAGE" -czf /work/vpu-userspace.tar.gz .
 echo "   vpu: $VPU_COPIED files; tarball: $(du -h /work/vpu-userspace.tar.gz | cut -f1)"
 
+
+# NPU userspace + demo
+echo ">> Building npu-userspace.tar.gz"
+NPU_STAGE=/tmp/npu-stage
+rm -rf "$NPU_STAGE"; mkdir -p "$NPU_STAGE"
+
+# libVIPhal.so is the VIP/NPU userspace HAL. The YOLOv5 tree is the demo that
+# ships with the Radxa userspace image. Keep this list deliberately small: it
+# mirrors the useful part of the manual extraction command and avoids copying
+# the source image's unrelated applications and development files.
+NPU_PATHS="
+/usr/lib/libVIPhal.so
+/opt/yolov5
+"
+NPU_COPIED=0
+for path in $NPU_PATHS; do
+  src="/mnt/radxa$path"
+  if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+    echo "ERROR: required NPU path is missing from Radxa image: $path" >&2
+    echo "       This image does not contain the expected VIP/YOLOv5 demo." >&2
+    exit 1
+  fi
+  mkdir -p "$NPU_STAGE$(dirname "$path")"
+  # Follow source-image symlinks so the standalone archive does not contain a
+  # link whose target was not included in this deliberately small bundle.
+  cp -aL "$src" "$NPU_STAGE$path"
+  NPU_COPIED=$((NPU_COPIED+1))
+done
+
+rm -f /work/npu-userspace.tar.gz
+tar --dereference --xattrs --numeric-owner -C "$NPU_STAGE" \
+  -czf /work/npu-userspace.tar.gz .
+echo "   npu: $NPU_COPIED paths; tarball: $(du -h /work/npu-userspace.tar.gz | cut -f1)"
+
 echo
 echo "Done. Tarballs in /work:"
-ls -lh /work/pvr-userspace.tar.gz /work/vpu-userspace.tar.gz
+ls -lh /work/pvr-userspace.tar.gz /work/vpu-userspace.tar.gz /work/npu-userspace.tar.gz
 echo
 echo "Apply on a running OPi 6.6 system with:"
-echo "  scp pvr-userspace.tar.gz vpu-userspace.tar.gz orangepi@<pi-ip>:/tmp/"
+echo "  scp pvr-userspace.tar.gz vpu-userspace.tar.gz npu-userspace.tar.gz orangepi@<pi-ip>:/tmp/"
 echo "  # then on the Pi:"
 echo "  sudo tar xzpf /tmp/pvr-userspace.tar.gz -C /"
 echo "  sudo tar xzpf /tmp/vpu-userspace.tar.gz -C /"
+echo "  sudo tar --dereference --xattrs --numeric-owner -xzpf /tmp/npu-userspace.tar.gz -C /"
 echo "  sudo ldconfig"
 echo "  sudo udevadm control --reload-rules && sudo udevadm trigger"
 echo "  sudo reboot"
