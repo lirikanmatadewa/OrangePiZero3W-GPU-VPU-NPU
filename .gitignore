@@ -3,6 +3,7 @@
 *.img.sha
 *.7z
 *.xz
+.env
 
 # Generated files
 hybrid-*.img

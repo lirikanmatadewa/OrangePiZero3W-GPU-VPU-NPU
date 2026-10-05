@@ -5,8 +5,7 @@
 # Run in a privileged debian:bookworm-slim container with this repository
 # mounted at /work.
 #
-# Inputs: /work/radxa-a733_bullseye_kde_r2.output_512.img and
-#         /work/Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
+# Inputs: selected compatible Radxa A733 and Debian Orange Pi Zero 3W images
 # Output: /work/pvr-userspace.tar.gz, /work/vpu-userspace.tar.gz, and
 #         /work/npu-userspace.tar.gz
 #
@@ -15,23 +14,13 @@
 
 set -euo pipefail
 
-RADXA_IMG=/work/radxa-a733_bullseye_kde_r2.output_512.img
-OPI_IMG=/work/Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
+IMAGE_DIR=/work
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/image-config.sh"
+load_image_config
 
-if [ ! -f "$RADXA_IMG" ]; then
-  echo "ERROR: $RADXA_IMG not found" >&2
-  echo "Download the Radxa A7S Bullseye KDE image" >&2
-  echo "and place it (uncompressed) at $RADXA_IMG." >&2
-  exit 1
-fi
-
-if [ ! -f "$OPI_IMG" ]; then
-  echo "ERROR: $OPI_IMG not found" >&2
-  echo "The NPU userspace is extracted from the Orange Pi image." >&2
-  exit 1
-fi
-
-# Read rootfs geometry from the image. Radxa A7S rootfs is GPT part 3.
+# Read rootfs geometry from the image. Supported layouts use Radxa GPT part 3
+# and Orange Pi MBR part 1.
 read -r RADXA_START RADXA_SECTORS < <(partx -g -b -o START,SECTORS -r --nr 3 "$RADXA_IMG")
 : "${RADXA_START:?could not read Radxa partition 3 from $RADXA_IMG}"
 : "${RADXA_SECTORS:?could not read Radxa partition 3 size from $RADXA_IMG}"
@@ -53,6 +42,8 @@ mount -o ro "$LOOP" /mnt/radxa
 mkdir -p /mnt/opi
 mount -o ro "$OPI_LOOP" /mnt/opi
 
+RADXA_INFO=/mnt/radxa/var/lib/dpkg/info
+
 cleanup() {
   umount -l /mnt/radxa 2>/dev/null || true
   umount -l /mnt/opi 2>/dev/null || true
@@ -61,13 +52,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if ! grep -Eiq '^ID="?debian"?$' /mnt/opi/etc/os-release; then
+  echo "ERROR: selected Orange Pi image is not Debian: $OPI_IMG" >&2
+  exit 1
+fi
+
 # pvr-userspace.tar.gz
 echo ">> Building pvr-userspace.tar.gz"
 PVR_STAGE=/tmp/pvr-stage
 rm -rf "$PVR_STAGE"; mkdir -p "$PVR_STAGE"
 
 
-PVR_LIST=/mnt/radxa/var/lib/dpkg/info/xserver-xorg-img-bxm-1.21.1-2.deb.list
+PVR_LIST=$(find_unique "Radxa PowerVR package manifest" "$RADXA_INFO" -maxdepth 1 -type f -name 'xserver-xorg-img-bxm*.list')
 PVR_COPIED=0
 while read -r path; do
   [ -z "$path" ] && continue
@@ -110,10 +106,9 @@ echo ">> Building vpu-userspace.tar.gz"
 VPU_STAGE=/tmp/vpu-stage
 rm -rf "$VPU_STAGE"; mkdir -p "$VPU_STAGE"
 
-VPU_LISTS="
-/mnt/radxa/var/lib/dpkg/info/libcedarc-dev-2.0.0-arm64.list
-/mnt/radxa/var/lib/dpkg/info/libgstreamer-openmax-allwinner.list
-"
+LIBCEDARC_LIST=$(find_unique "Radxa libcedarc package manifest" "$RADXA_INFO" -maxdepth 1 -type f -name 'libcedarc*.list')
+GSTOMX_LIST=$(find_unique "Radxa GStreamer OMX package manifest" "$RADXA_INFO" -maxdepth 1 -type f -name 'libgstreamer-openmax-allwinner*.list')
+VPU_LISTS="$LIBCEDARC_LIST $GSTOMX_LIST"
 
 VPU_COPIED=0
 for L in $VPU_LISTS; do

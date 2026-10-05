@@ -2,20 +2,20 @@
 
 The Orange Pi Zero 3W's Allwinner A733 has an Imagination PowerVR BXM-4-64 GPU, an Allwinner Cedar video engine, and a VIP/NPU accelerator. Orange Pi's stock image ships without the userspace needed to use these accelerators. Radxa's Cubie A7S uses the same A733 silicon and ships compatible PowerVR, Cedar, and VIP userspace in its Debian image.
 
-These scripts build an Orange Pi Zero 3W Ubuntu image with working GPU, VPU, and NPU userspace. GPU/VPU userspace is grafted from a Radxa image, while the NPU userspace already present in the Orange Pi image is retained, then the PowerVR kernel module is rebuilt against Orange Pi's kernel with DKMS.
+These scripts build a Debian Orange Pi Zero 3W image with GPU, VPU, and NPU userspace. GPU/VPU userspace is grafted from a compatible Radxa A733 image, while the NPU userspace already present in the Orange Pi image is retained. The PowerVR kernel module is rebuilt against the selected Orange Pi kernel with DKMS.
 
 No proprietary binaries live in this repository. The GPU/VPU files come from the Radxa image and the NPU files come from the Orange Pi image on your own machine at build time. There's a longer write-up in [this XDA article](https://www.xda-developers.com/orange-pi-zero-3w-beats-raspberry-pi-5-cant-use-half-hardware/).
 
 ## What works
 
-On the tested image pair, the result has:
+When the selected images contain the required compatible userspace and kernel headers, the result has:
 
 - PowerVR Vulkan/OpenGL ES/OpenCL userspace
-- `pvrsrvkm` rebuilt for Orange Pi's `6.6.98-sun60iw2` kernel, with PowerVR firmware and the Vulkan ICD in place
+- `pvrsrvkm` rebuilt for the selected Orange Pi kernel, with PowerVR firmware and the Vulkan ICD in place
 - Allwinner CedarC/libcedarc userspace
 - VIP/NPU userspace (`libVIPhal.so`) and the Orange Pi `/opt/yolov5` demo tree
 - Hardware video decode/encode through GStreamer's OMX plugins
-- Hardware-accelerated WebGL/WebGPU in Chromium via ANGLE-on-Vulkan, installed from the saiarcot895 PPA (Ubuntu's repository `chromium-browser` is only a Snap transition package that's unsuitable for this userspace). Two test launchers are added to the desktop. The first is a WebGL aquarium and the second is a `chrome://gpu` shortcut
+- The selected Debian image's original browser and desktop setup, which the builder leaves unchanged
 - Orange Pi's original bootloader, kernel, DTB, Wi-Fi, Bluetooth, desktop, and default user are all untouched
 
 The NPU portion is userspace integration: the image builder retains the VIP HAL
@@ -26,27 +26,21 @@ the supplied NPU userspace.
 
 ## Source images
 
-Download both images, then verify each against the checksum the vendor actually publishes. The two cover different files: OrangePi checksums the extracted `.img`, while Radxa checksums the downloaded `.xz`. Each value below is the one that vendor signs, so they're verified at different stages.
+Download a Debian Orange Pi Zero 3W image and a Radxa A733 image from their vendor pages, then verify them using the checksums published by each vendor:
 
-**Orange Pi Zero 3W: Ubuntu Jammy XFCE desktop, kernel 6.6.98**
-- Download: <http://www.orangepi.org/html/hardWare/computerAndMicrocontrollers/details/Orange-Pi-Zero-3W.html>
-- Archive `Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.7z`, which extracts to `Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img`
-- SHA256 of the extracted `.img`: `af6697c4f158f63ffdf55f5a17453ef3b9b2895f35b2891e6090d28f65faf264`
+- Orange Pi Zero 3W: <http://www.orangepi.org/html/hardWare/computerAndMicrocontrollers/details/Orange-Pi-Zero-3W.html>
+- Radxa Cubie A7S: <https://docs.radxa.com/en/cubie/a7s/download>
 
-**Radxa Cubie A7S: Bullseye KDE, kernel 5.15.147**
-- Download: <https://docs.radxa.com/en/cubie/a7s/download>
-- Archive `radxa-a733_bullseye_kde_r2.output_512.img.xz`, which extracts to `radxa-a733_bullseye_kde_r2.output_512.img`
-- SHA256 of the downloaded `.xz`: `1b5604fed61647ab1b510f24af5968477e8a7a361430aa0864efbed7b5fe6ca2`
+For the full image build, put the uncompressed `.img` files in the directory you mount at `/work`. Copy `.env.example` to `.env` and set the exact filenames:
 
-```bash
-# OPi: verify the .img after extracting the .7z
-shasum -a 256 Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
-
-# Radxa: verify the downloaded archive before extracting
-shasum -a 256 radxa-a733_bullseye_kde_r2.output_512.img.xz
+```dotenv
+OPI_IMAGE=Orangepizero3w_1.0.2_debian_trixie_desktop_xfce_linux6.6.98.img
+RADXA_IMAGE=radxa-a733_trixie_kde_t6.output_512.img
 ```
 
-I only tested this exact image pair. The scripts read partition offsets from each image's own partition table, but the package names and paths are hardcoded to those two BSP images, including `/usr/lib/libVIPhal.so` and `/opt/yolov5` for NPU support. A different or newer image may need small path/package-name fixes. When an input doesn't match, the scripts fail at the missing file rather than producing a broken image.
+The values are filenames, not paths. Leave either value empty to auto-detect it when exactly one matching image is present. If none or multiple matches are found, the build stops and lists the candidates. The Orange Pi selection must be a Debian Zero 3W image; the Radxa selection must be an A733 image containing the GPU/VPU package manifests and files the build validates. The current image layouts must expose Orange Pi rootfs as MBR partition 1 and Radxa rootfs as GPT partition 3. Other Radxa releases/layouts may not be compatible.
+
+The selected Debian image must include one kernel release under `/lib/modules` with a matching kernel-header `.deb` under `/opt`. The builder checks the package contents before grafting accelerator files and stops if it cannot find a unique matching kernel/header pair.
 
 ## Build a flashable image
 
@@ -57,16 +51,17 @@ docker run --rm --privileged -v "$(pwd):/work" -w /work \
   debian:bookworm-slim bash /work/scripts/build.sh
 ```
 
-The output is `hybrid-opi66-with-radxa-gpu-vpu-npu.img`. Flash it with your usual imaging tool, or with `dd`.
+The output is `YYYYMMDD-<Debian-image-basename>+radxa_gpu_vpu_npu.img` in `/work`; for example, `20261002-Orangepizero3w_1.0.2_debian_trixie_desktop_xfce_linux6.6.98+radxa_gpu_vpu_npu.img`. The Debian source image is left unchanged. Flash the result with your usual imaging tool, or with `dd`.
 
-To rebuild the PowerVR module, `build.sh` runs DKMS against the kernel headers the stock Orange Pi image already ships at `/opt/linux-headers-current-sun60iw2_*.deb`. The build depends on that `.deb` being present there; the pinned image carries it.
+The Ubuntu-only Chromium PPA setup is not run; the selected Debian image's browser and desktop packages are left as supplied.
 
 macOS:
 
 ```bash
 diskutil list
 sudo diskutil unmountDisk /dev/diskN
-sudo dd if=hybrid-opi66-with-radxa-gpu-vpu-npu.img of=/dev/rdiskN bs=4m status=progress
+OUTPUT_IMAGE="YYYYMMDD-Debian-image-basename+radxa_gpu_vpu_npu.img"
+sudo dd if="$OUTPUT_IMAGE" of=/dev/rdiskN bs=4m status=progress
 sudo diskutil eject /dev/diskN
 ```
 
@@ -82,7 +77,8 @@ docker run --rm --privileged -v "$(pwd):/work" -w /work \
 ```
 
 This command expects both source images in `/work`: Radxa supplies GPU/VPU
-files, and the Orange Pi image supplies the NPU files.
+files, and the Debian Orange Pi image supplies the NPU files. It reads `.env`
+from `/work` using the same selectors described above.
 
 Or use the repository wrapper, which checks both images before starting Docker:
 
@@ -90,7 +86,9 @@ Or use the repository wrapper, which checks both images before starting Docker:
 ./build-tarballs.sh
 ```
 
-That produces three independent bundles:
+For `./build-tarballs.sh`, place both images under the repository's `work/`
+directory. The wrapper reads `.env` from the repository root and passes the
+selected filenames into Docker. The command produces three independent bundles:
 
 - `pvr-userspace.tar.gz`: PowerVR userspace and firmware files
 - `vpu-userspace.tar.gz`: Cedar/libcedarc and GStreamer OMX files

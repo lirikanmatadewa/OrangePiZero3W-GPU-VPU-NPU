@@ -1,30 +1,29 @@
 #!/bin/bash
-# Build an Orange Pi Zero 3W image with Radxa's A733 GPU/VPU/NPU userspace.
+# Build a Debian Orange Pi Zero 3W image with compatible Radxa A733 GPU/VPU userspace.
 #
 # Run this in a privileged debian:bookworm-slim container with the repository
-# mounted at /work. The two source images must be placed in /work first.
+# mounted at /work. Put the source images and optional .env in /work.
 #
-# Output: /work/hybrid-opi66-with-radxa-gpu-vpu-npu.img
+# Output: /work/YYYYMMDD-<Debian-image-basename>+radxa_gpu_vpu_npu.img
 #
 # No proprietary binaries are stored in this repository. This script only copies
 # files from the Radxa image supplied by the user.
 
 set -euo pipefail
 
-OPI_IMG=/work/Orangepizero3w_1.0.0_ubuntu_jammy_desktop_xfce_linux6.6.98.img
-RADXA_IMG=/work/radxa-a733_bullseye_kde_r2.output_512.img
-OUT_IMG=/work/hybrid-opi66-with-radxa-gpu-vpu-npu.img
+IMAGE_DIR=/work
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/image-config.sh"
+load_image_config
 
-RADXA_KVER=5.15.147-14-a733
-OPI_KVER=6.6.98-sun60iw2
+OPI_BASENAME=${OPI_IMAGE%.*}
+OPI_EXTENSION=${OPI_IMAGE##*.}
+OUT_IMG="$IMAGE_DIR/$(date +%Y%m%d)-${OPI_BASENAME}+radxa_gpu_vpu_npu.${OPI_EXTENSION}"
 
-for f in "$OPI_IMG" "$RADXA_IMG"; do
-  if [ ! -f "$f" ]; then
-    echo "ERROR: required input image not found: $f" >&2
-    echo "  See the comment block at the top of this script for download URLs." >&2
-    exit 1
-  fi
-done
+if [[ "$OUT_IMG" == "$OPI_IMG" ]]; then
+  echo "ERROR: output path would overwrite the Debian source image: $OPI_IMG" >&2
+  exit 1
+fi
 
 # Read partition geometry from each image: OPi rootfs is MBR part 1; Radxa is GPT part 3.
 read -r OPI_START _ < <(partx -g -b -o START,SECTORS -r --nr 1 "$OPI_IMG")
@@ -41,7 +40,7 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   qemu-user-static binfmt-support > /dev/null
 
-echo ">> [host] Cloning OPi 6.6 image -> $(basename $OUT_IMG)"
+echo ">> [host] Cloning Debian OPi image -> $(basename "$OUT_IMG")"
 rm -f "$OUT_IMG"
 cp "$OPI_IMG" "$OUT_IMG"
 
@@ -64,18 +63,75 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if ! grep -Eiq '^ID="?debian"?$' /mnt/out/etc/os-release; then
+  echo "ERROR: selected Orange Pi rootfs is not Debian: $OPI_IMG" >&2
+  exit 1
+fi
+
+shopt -s nullglob
+OPI_MODULE_DIRS=(/mnt/out/lib/modules/*)
+OPI_HEADER_DEBS=(/mnt/out/opt/linux-headers*.deb)
+shopt -u nullglob
+if (( ${#OPI_MODULE_DIRS[@]} != 1 )); then
+  echo "ERROR: expected one kernel release under /lib/modules in $OPI_IMG; found ${#OPI_MODULE_DIRS[@]}" >&2
+  printf '  %s\n' "${OPI_MODULE_DIRS[@]}" >&2
+  exit 1
+fi
+OPI_KVER=$(basename "${OPI_MODULE_DIRS[0]}")
+OPI_HEADER_PACKAGES=()
+for header_deb in "${OPI_HEADER_DEBS[@]}"; do
+  header_contents=$(dpkg-deb -c "$header_deb")
+  if grep -F "linux-headers-$OPI_KVER/" <<<"$header_contents" >/dev/null; then
+    OPI_HEADER_PACKAGES+=("$header_deb")
+  fi
+done
+if (( ${#OPI_HEADER_PACKAGES[@]} != 1 )); then
+  echo "ERROR: expected one /opt header package containing linux-headers-$OPI_KVER in $OPI_IMG; found ${#OPI_HEADER_PACKAGES[@]}" >&2
+  printf '  %s\n' "${OPI_HEADER_DEBS[@]}" >&2
+  exit 1
+fi
+OPI_HEADER_DEB=$(basename "${OPI_HEADER_PACKAGES[0]}")
+echo ">> [check] Debian target kernel: $OPI_KVER; headers: $OPI_HEADER_DEB"
+
+RADXA_INFO=/mnt/radxa/var/lib/dpkg/info
+PVR_LIST=$(find_unique "Radxa PowerVR package manifest" "$RADXA_INFO" -maxdepth 1 -type f -name 'xserver-xorg-img-bxm*.list')
+LIBCEDARC_LIST=$(find_unique "Radxa libcedarc package manifest" "$RADXA_INFO" -maxdepth 1 -type f -name 'libcedarc*.list')
+GSTOMX_LIST=$(find_unique "Radxa GStreamer OMX package manifest" "$RADXA_INFO" -maxdepth 1 -type f -name 'libgstreamer-openmax-allwinner*.list')
+DKMS_SOURCE=$(find_unique "Radxa img-bxm DKMS source" /mnt/radxa/usr/src -mindepth 1 -maxdepth 1 -type d -name 'img-bxm-dkms-*')
+RADXA_SID_HEADER=$(find_unique "Radxa sunxi-sid.h header" /mnt/radxa/usr/src -type f -path '*/bsp/include/sunxi-sid.h')
+DKMS_SOURCE_NAME=$(basename "$DKMS_SOURCE")
+DKMS_VERSION=${DKMS_SOURCE_NAME#img-bxm-dkms-}
+RADXA_HEADER_DIR=$(dirname "$(dirname "$(dirname "$RADXA_SID_HEADER")")")
+RADXA_KVER=${RADXA_HEADER_DIR##*/linux-headers-}
+for required_path in \
+  /mnt/radxa/usr/share/vulkan/icd.d/img_icd.json \
+  /mnt/radxa/etc/ld.so.conf.d/00_xserver-xorg-img-bxm.conf; do
+  if [[ ! -f "$required_path" ]]; then
+    echo "ERROR: compatible Radxa image is missing required file: ${required_path#/mnt/radxa}" >&2
+    exit 1
+  fi
+done
+shopt -s nullglob
+RADXA_FIRMWARE=(/mnt/radxa/lib/firmware/rgx.*)
+shopt -u nullglob
+if (( ${#RADXA_FIRMWARE[@]} == 0 )); then
+  echo "ERROR: compatible Radxa image has no /lib/firmware/rgx.* files" >&2
+  exit 1
+fi
+echo ">> [check] Radxa kernel headers: $RADXA_KVER; DKMS source: $DKMS_SOURCE_NAME"
+
 echo ">> [graft] Copying img-bxm-dkms source from Radxa"
-cp -a /mnt/radxa/usr/src/img-bxm-dkms-0.1.0-2 /mnt/out/usr/src/
+cp -a "$DKMS_SOURCE" /mnt/out/usr/src/
 
 echo ">> [graft] Pre-staging sunxi-sid.h for use inside chroot"
 mkdir -p /mnt/out/tmp
-cp /mnt/radxa/usr/src/linux-headers-${RADXA_KVER}/bsp/include/sunxi-sid.h /mnt/out/tmp/sunxi-sid.h
+cp "$RADXA_SID_HEADER" /mnt/out/tmp/sunxi-sid.h
 
-echo ">> [graft] Copying files installed by xserver-xorg-img-bxm-1.21.1-2"
+echo ">> [graft] Copying files from Radxa PowerVR package manifest"
 
 # Copy Radxa's PowerVR userspace package, except the parts that would replace
 # OPi's Xorg/lightdm setup.
-LIST=/mnt/radxa/var/lib/dpkg/info/xserver-xorg-img-bxm-1.21.1-2.deb.list
+LIST=$PVR_LIST
 COPIED=0
 SKIPPED_CONFLICT=0
 SKIPPED_MISSING=0
@@ -88,7 +144,7 @@ while read -r path; do
       SKIPPED_CONFLICT=$((SKIPPED_CONFLICT+1))
       continue
       ;;
-    # Use Ubuntu's Vulkan loader as the Radxa loader lacks Wayland symbols.
+    # Keep the target distribution's Vulkan loader; Radxa's lacks Wayland symbols.
     /usr/local/lib/libvulkan.so*)
       SKIPPED_CONFLICT=$((SKIPPED_CONFLICT+1))
       continue
@@ -131,10 +187,7 @@ echo "pvrsrvkm" > /mnt/out/etc/modules-load.d/pvr.conf
 
 echo ">> [graft] Allwinner VPU userspace (libcedarc + gst-openmax)"
 
-VPU_LISTS="
-/mnt/radxa/var/lib/dpkg/info/libcedarc-dev-2.0.0-arm64.list
-/mnt/radxa/var/lib/dpkg/info/libgstreamer-openmax-allwinner.list
-"
+VPU_LISTS="$LIBCEDARC_LIST $GSTOMX_LIST"
 VPU_COPIED=0
 for L in $VPU_LISTS; do
   while read -r path; do
@@ -143,7 +196,7 @@ for L in $VPU_LISTS; do
       /usr/include/*|/usr/share/doc/*|/usr/share/metainfo/*|/usr/share/man/*) continue;;
     esac
     src="/mnt/radxa$path"
-    # Keep Jammy's merged-/usr layout intact.
+    # Keep the target image's merged-/usr layout intact.
     case "$path" in
       /lib/*) dst_path="/usr$path" ;;
       *) dst_path="$path" ;;
@@ -221,47 +274,6 @@ Section "Device"
 EndSection
 EOF
 
-echo ">> [graft] Stage Chromium PPA + WebGL test desktop launchers"
-# Use a deb-packaged Chromium build instead of Ubuntu's snap redirector.
-# The PPA itself is added by add-apt-repository in the chroot; here we only drop
-# the pin so apt prefers it.
-mkdir -p /mnt/out/etc/apt/preferences.d
-cat > /mnt/out/etc/apt/preferences.d/saiarcot895-chromium <<'EOF'
-Package: chromium-browser*
-Pin: release o=LP-PPA-saiarcot895-chromium-beta
-Pin-Priority: 1001
-EOF
-
-# Add launchers for a quick GPU check.
-mkdir -p /mnt/out/etc/skel/Desktop /mnt/out/home/orangepi/Desktop
-cat > /mnt/out/etc/skel/Desktop/chromium-webgl-test.desktop <<'EOF'
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Chromium - WebGL Test (Aquarium)
-Comment=Chromium with ANGLE-on-Vulkan, opens WebGL Aquarium benchmark
-Icon=chromium-browser
-Exec=chromium-browser --use-gl=angle --use-angle=vulkan --enable-features=Vulkan,VulkanFromANGLE --ignore-gpu-blocklist --enable-unsafe-webgpu --new-window https://webglsamples.org/aquarium/aquarium.html
-Terminal=false
-Categories=Network;WebBrowser;
-EOF
-cat > /mnt/out/etc/skel/Desktop/chromium-gpu-info.desktop <<'EOF'
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Chromium - chrome://gpu
-Comment=Chromium GPU info page (verify HW accel)
-Icon=chromium-browser
-Exec=chromium-browser --use-gl=angle --use-angle=vulkan --enable-features=Vulkan,VulkanFromANGLE --ignore-gpu-blocklist --new-window chrome://gpu
-Terminal=false
-Categories=Network;WebBrowser;
-EOF
-chmod +x /mnt/out/etc/skel/Desktop/*.desktop
-cp /mnt/out/etc/skel/Desktop/*.desktop /mnt/out/home/orangepi/Desktop/
-chmod +x /mnt/out/home/orangepi/Desktop/*.desktop
-# orangepi:orangepi is uid/gid 1000 in the stock image.
-chown -R 1000:1000 /mnt/out/home/orangepi/Desktop 2>/dev/null || true
-
 echo ">> [graft] OpenCV 4.5d -> 4.5 SONAME compat for OPi-bundled YOLOv5 demo"
 # The bundled YOLOv5 demo expects unsuffixed OpenCV 4.5 SONAMEs.
 LIBDIR=/mnt/out/usr/lib/aarch64-linux-gnu
@@ -284,24 +296,20 @@ echo "nameserver 8.8.8.8" > /mnt/out/etc/resolv.conf
 echo
 echo "==================== ENTERING ARM64 CHROOT ===================="
 chroot /mnt/out /bin/bash <<CHROOT_EOF
-set -e
+set -euo pipefail
 export OPI_KVER=${OPI_KVER}
+export DKMS_SOURCE_NAME=${DKMS_SOURCE_NAME}
+export DKMS_VERSION=${DKMS_VERSION}
 
 echo ">> [chroot] \$(uname -m) on \$(grep PRETTY /etc/os-release | cut -d'"' -f2)"
 
 echo ">> [chroot] Installing build deps"
+apt-get update 2>&1 | tail -3
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  build-essential dkms software-properties-common 2>&1 | tail -3
-
-echo ">> [chroot] Adding saiarcot895 PPA and installing real (non-snap) Chromium"
-DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:saiarcot895/chromium-beta 2>&1 | tail -3
-DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 | tail -3
-# Pin file dropped during graft phase makes apt prefer the PPA version
-DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades chromium-browser 2>&1 | tail -3
-chromium-browser --version || echo "WARN: chromium install may not have succeeded"
+  build-essential dkms 2>&1 | tail -3
 
 echo ">> [chroot] Installing OPi-staged kernel headers from /opt/"
-DEBIAN_FRONTEND=noninteractive dpkg -i /opt/linux-headers-current-sun60iw2_*.deb 2>&1 | tail -5
+DEBIAN_FRONTEND=noninteractive dpkg -i "/opt/${OPI_HEADER_DEB}" 2>&1 | tail -5
 
 echo ">> [chroot] Staging sunxi-sid.h into OPi BSP includes"
 mkdir -p /usr/src/linux-headers-\${OPI_KVER}/bsp/include
@@ -309,17 +317,16 @@ cp /tmp/sunxi-sid.h /usr/src/linux-headers-\${OPI_KVER}/bsp/include/
 ls -la /usr/src/linux-headers-\${OPI_KVER}/bsp/include/sunxi-sid.h
 
 echo ">> [chroot] DKMS install img-bxm-dkms/0.1.0-2 (build + install)"
-dkms add /usr/src/img-bxm-dkms-0.1.0-2 2>&1 | tail -3 || true
-dkms install img-bxm-dkms/0.1.0-2 -k \${OPI_KVER} 2>&1 | tail -15
+dkms add "/usr/src/${DKMS_SOURCE_NAME}" 2>&1 | tail -3 || true
+dkms install "img-bxm-dkms/${DKMS_VERSION}" -k \${OPI_KVER} 2>&1 | tail -15
 
 echo ">> [chroot] dkms status:"
 dkms status
 
 echo ">> [chroot] Verifying pvrsrvkm.ko placement"
 find /lib/modules/\${OPI_KVER}/updates -name "pvrsrvkm*" -ls 2>/dev/null
-# The DKMS step above is piped to tail, so set -e can't see it fail. Check the
-# built module directly: without it the image has no GPU, so abort rather than
-# ship a broken image silently.
+# Check the built module directly: without it the image has no GPU, so abort
+# rather than ship a broken image silently.
 if ! ls /lib/modules/\${OPI_KVER}/updates/dkms/pvrsrvkm.ko* >/dev/null 2>&1; then
   echo "ERROR: DKMS did not produce pvrsrvkm.ko for \${OPI_KVER}; aborting." >&2
   exit 1
