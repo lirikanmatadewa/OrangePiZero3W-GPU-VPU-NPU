@@ -1,0 +1,13 @@
+[workspace]
+authors = ["Lirikan Mata Dewa <lirikanmatadew@gmail.com>"]
+channels = ["conda-forge"]
+name = "OrangePiZero3W-GPU-VPU-NPU"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+check = { cmd = "bash -n scripts/build.sh && bash -n scripts/image-config.sh && bash -n scripts/make-tarball.sh && bash -n build-tarballs.sh", description = "Check all build script syntax" }
+build = { cmd = 'docker run --rm --privileged -v "$PWD:/work" -w /work debian:bookworm-slim bash /work/scripts/build.sh', depends-on = ["check"], description = "Build the flashable GPU/VPU/NPU image" }
+tarballs = { cmd = 'docker run --rm --privileged -v "$PWD:/work" -w /work debian:bookworm-slim bash /work/scripts/make-tarball.sh', depends-on = ["check"], description = "Extract GPU/VPU/NPU userspace tarballs" }
+
+[dependencies]

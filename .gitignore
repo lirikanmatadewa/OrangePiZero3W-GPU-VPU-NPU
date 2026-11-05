@@ -10,9 +10,13 @@ hybrid-*.img
 opi-*.img
 pvr-userspace.tar.gz
 vpu-userspace.tar.gz
+npu-userspace.tar.gz
 
 # Logs and local files
 *.log
 screenlog.*
 .DS_Store
 Thumbs.db
+# pixi environments
+.pixi/*
+!.pixi/config.toml

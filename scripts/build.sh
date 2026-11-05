@@ -20,8 +20,8 @@ OPI_BASENAME=${OPI_IMAGE%.*}
 OPI_EXTENSION=${OPI_IMAGE##*.}
 OUT_IMG="$IMAGE_DIR/$(date +%Y%m%d)-${OPI_BASENAME}+radxa_gpu_vpu_npu.${OPI_EXTENSION}"
 
-if [[ "$OUT_IMG" == "$OPI_IMG" ]]; then
-  echo "ERROR: output path would overwrite the Debian source image: $OPI_IMG" >&2
+if [[ "$OUT_IMG" == "$OPI_IMG" || "$OUT_IMG" == "$RADXA_IMG" || "$OUT_IMG" == "$NPU_IMG" ]]; then
+  echo "ERROR: output path would overwrite a source image: $OUT_IMG" >&2
   exit 1
 fi
 
@@ -44,6 +44,30 @@ echo ">> [host] Cloning Debian OPi image -> $(basename "$OUT_IMG")"
 rm -f "$OUT_IMG"
 cp "$OPI_IMG" "$OUT_IMG"
 
+OUT_LOOP=
+RADXA_LOOP=
+NPU_LOOP=
+RESOLV_REPLACED=false
+cleanup() {
+  echo ">> [host] cleanup"
+  if [[ "$RESOLV_REPLACED" == true ]]; then
+    rm -f /mnt/out/etc/resolv.conf
+    if [[ -e /tmp/resolv.bak || -L /tmp/resolv.bak ]]; then
+      cp -a /tmp/resolv.bak /mnt/out/etc/resolv.conf
+    fi
+  fi
+  umount -lR /mnt/out/run /mnt/out/dev /mnt/out/sys /mnt/out/proc 2>/dev/null || true
+  umount -l /mnt/out 2>/dev/null || true
+  umount -l /mnt/radxa 2>/dev/null || true
+  if [[ -n "$NPU_LOOP" ]]; then
+    umount /mnt/npu 2>/dev/null || true
+    losetup -d "$NPU_LOOP" 2>/dev/null || true
+  fi
+  [[ -z "$OUT_LOOP" ]] || losetup -d "$OUT_LOOP" 2>/dev/null || true
+  [[ -z "$RADXA_LOOP" ]] || losetup -d "$RADXA_LOOP" 2>/dev/null || true
+}
+trap cleanup EXIT
+
 OUT_LOOP=$(losetup -o $OPI_PART_OFFSET -f --show "$OUT_IMG")
 RADXA_LOOP=$(losetup -o $RADXA_PART_OFFSET --sizelimit $RADXA_PART_SIZE -f --show "$RADXA_IMG")
 echo "   out rootfs: $OUT_LOOP"
@@ -53,20 +77,12 @@ mkdir -p /mnt/out /mnt/radxa
 mount "$OUT_LOOP" /mnt/out
 mount -o ro "$RADXA_LOOP" /mnt/radxa
 
-cleanup() {
-  echo ">> [host] cleanup"
-  umount -lR /mnt/out/run /mnt/out/dev /mnt/out/sys /mnt/out/proc 2>/dev/null || true
-  umount -l /mnt/out 2>/dev/null || true
-  umount -l /mnt/radxa 2>/dev/null || true
-  losetup -d "$OUT_LOOP" 2>/dev/null || true
-  losetup -d "$RADXA_LOOP" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-if ! grep -Eiq '^ID="?debian"?$' /mnt/out/etc/os-release; then
-  echo "ERROR: selected Orange Pi rootfs is not Debian: $OPI_IMG" >&2
+if ! is_debian_compatible /mnt/out/etc/os-release; then
+  echo "ERROR: selected Orange Pi rootfs is not Debian-compatible: $OPI_IMG" >&2
   exit 1
 fi
+
+prepare_npu_source /mnt/out
 
 shopt -s nullglob
 OPI_MODULE_DIRS=(/mnt/out/lib/modules/*)
@@ -78,20 +94,26 @@ if (( ${#OPI_MODULE_DIRS[@]} != 1 )); then
   exit 1
 fi
 OPI_KVER=$(basename "${OPI_MODULE_DIRS[0]}")
-OPI_HEADER_PACKAGES=()
-for header_deb in "${OPI_HEADER_DEBS[@]}"; do
-  header_contents=$(dpkg-deb -c "$header_deb")
-  if grep -F "linux-headers-$OPI_KVER/" <<<"$header_contents" >/dev/null; then
-    OPI_HEADER_PACKAGES+=("$header_deb")
+OPI_HEADER_DIR="/mnt/out/usr/src/linux-headers-$OPI_KVER"
+OPI_HEADER_SOURCE=installed
+OPI_HEADER_DEB=
+if [[ ! -d "$OPI_HEADER_DIR" ]]; then
+  OPI_HEADER_PACKAGES=()
+  for header_deb in "${OPI_HEADER_DEBS[@]}"; do
+    header_contents=$(dpkg-deb -c "$header_deb")
+    if grep -F "linux-headers-$OPI_KVER/" <<<"$header_contents" >/dev/null; then
+      OPI_HEADER_PACKAGES+=("$header_deb")
+    fi
+  done
+  if (( ${#OPI_HEADER_PACKAGES[@]} != 1 )); then
+    echo "ERROR: expected installed headers under /usr/src/linux-headers-$OPI_KVER or one matching /opt header package in $OPI_IMG; found ${#OPI_HEADER_PACKAGES[@]}" >&2
+    printf '  %s\n' "${OPI_HEADER_DEBS[@]}" >&2
+    exit 1
   fi
-done
-if (( ${#OPI_HEADER_PACKAGES[@]} != 1 )); then
-  echo "ERROR: expected one /opt header package containing linux-headers-$OPI_KVER in $OPI_IMG; found ${#OPI_HEADER_PACKAGES[@]}" >&2
-  printf '  %s\n' "${OPI_HEADER_DEBS[@]}" >&2
-  exit 1
+  OPI_HEADER_DEB=$(basename "${OPI_HEADER_PACKAGES[0]}")
+  OPI_HEADER_SOURCE=package
 fi
-OPI_HEADER_DEB=$(basename "${OPI_HEADER_PACKAGES[0]}")
-echo ">> [check] Debian target kernel: $OPI_KVER; headers: $OPI_HEADER_DEB"
+echo ">> [check] target kernel: $OPI_KVER; headers: ${OPI_HEADER_DEB:-$OPI_HEADER_DIR}"
 
 RADXA_INFO=/mnt/radxa/var/lib/dpkg/info
 PVR_LIST=$(find_unique "Radxa PowerVR package manifest" "$RADXA_INFO" -maxdepth 1 -type f -name 'xserver-xorg-img-bxm*.list')
@@ -210,19 +232,12 @@ for L in $VPU_LISTS; do
 done
 echo "   VPU files copied: $VPU_COPIED"
 
-# The VIP/NPU userspace and YOLOv5 demo are supplied by the Orange Pi image,
-# not the Radxa KDE image. The output started as a clone of that image, so
-# retain the files in place and verify that the source image really has them.
-echo ">> [check] VIP/NPU userspace and YOLOv5 demo from Orange Pi"
-for npu_path in /usr/lib/libVIPhal.so /opt/yolov5; do
-  npu_src="/mnt/out$npu_path"
-  if [ ! -e "$npu_src" ] && [ ! -L "$npu_src" ]; then
-    echo "ERROR: required NPU path is missing from Orange Pi image: $npu_path" >&2
-    echo "       This image does not contain the expected VIP/YOLOv5 demo." >&2
-    exit 1
-  fi
-done
-echo "   NPU paths present: /usr/lib/libVIPhal.so /opt/yolov5"
+if [[ "$NPU_IMG" != "$OPI_IMG" ]]; then
+  echo ">> [graft] Copying VIP/NPU userspace and YOLOv5 demo from Orange Pi donor"
+  copy_npu_userspace /mnt/out
+else
+  echo ">> [check] Retaining VIP/NPU userspace and YOLOv5 demo from target image"
+fi
 
 echo ">> [graft] Patching gstomx.conf"
 
@@ -235,12 +250,7 @@ echo ">> [graft] Patching gstomx.conf"
 # Valid flag names were taken from the plugin binary:
 #   strings /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstomx.so | \
 #     grep -E "^(no-|event-|signals-|pass-|height-)"
-GSTOMX_STAGED=/mnt/out/etc/xdg/gstomx.conf
-if [ -f "$GSTOMX_STAGED" ]; then
-  HACKS="event-port-settings-changed-ndata-parameter-swap;event-port-settings-changed-port-0-to-1;no-disable-outport;no-component-reconfigure;no-component-role;no-empty-eos-buffer;pass-color-format-to-decoder;pass-profile-to-decoder;signals-premature-eos;height-multiple-16"
-  sed -i "s|^hacks=.*|hacks=$HACKS|" "$GSTOMX_STAGED"
-  echo "   gstomx.conf patched; $(grep -c '^hacks=' "$GSTOMX_STAGED") entries updated"
-fi
+install_gstomx_config /mnt/out /mnt/radxa
 
 echo ">> [graft] Adding udev rule for /dev/cedar_dev_ve2"
 
@@ -290,35 +300,46 @@ mount --rbind /sys /mnt/out/sys
 mount --rbind /dev /mnt/out/dev
 mkdir -p /mnt/out/run
 mount -t tmpfs tmpfs /mnt/out/run
-cp /mnt/out/etc/resolv.conf /tmp/resolv.bak 2>/dev/null || true
-echo "nameserver 8.8.8.8" > /mnt/out/etc/resolv.conf
+if [[ -e /mnt/out/etc/resolv.conf || -L /mnt/out/etc/resolv.conf ]]; then
+  cp -a /mnt/out/etc/resolv.conf /tmp/resolv.bak
+fi
+RESOLV_REPLACED=true
+rm -f /mnt/out/etc/resolv.conf
+cp /etc/resolv.conf /mnt/out/etc/resolv.conf
 
 echo
 echo "==================== ENTERING ARM64 CHROOT ===================="
 chroot /mnt/out /bin/bash <<CHROOT_EOF
 set -euo pipefail
 export OPI_KVER=${OPI_KVER}
+export OPI_HEADER_SOURCE=${OPI_HEADER_SOURCE}
 export DKMS_SOURCE_NAME=${DKMS_SOURCE_NAME}
 export DKMS_VERSION=${DKMS_VERSION}
 
 echo ">> [chroot] \$(uname -m) on \$(grep PRETTY /etc/os-release | cut -d'"' -f2)"
 
 echo ">> [chroot] Installing build deps"
-apt-get update 2>&1 | tail -3
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  build-essential dkms 2>&1 | tail -3
+apt-get update -qq -o APT::Update::Error-Mode=any
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+  build-essential dkms gstreamer1.0-tools \
+  libxcb-dri2-0 libxcb-dri3-0 libxcb-present0 libxcb-randr0 \
+  libxcb-sync1 libxcb-xfixes0 libxshmfence1
 
-echo ">> [chroot] Installing OPi-staged kernel headers from /opt/"
-DEBIAN_FRONTEND=noninteractive dpkg -i "/opt/${OPI_HEADER_DEB}" 2>&1 | tail -5
+if [[ "${OPI_HEADER_SOURCE}" == package ]]; then
+  echo ">> [chroot] Installing OPi-staged kernel headers from /opt/"
+  DEBIAN_FRONTEND=noninteractive dpkg -i "/opt/${OPI_HEADER_DEB}" 2>&1 | tail -5
+else
+  echo ">> [chroot] Using installed kernel headers under /usr/src/"
+fi
 
 echo ">> [chroot] Staging sunxi-sid.h into OPi BSP includes"
 mkdir -p /usr/src/linux-headers-\${OPI_KVER}/bsp/include
 cp /tmp/sunxi-sid.h /usr/src/linux-headers-\${OPI_KVER}/bsp/include/
 ls -la /usr/src/linux-headers-\${OPI_KVER}/bsp/include/sunxi-sid.h
 
-echo ">> [chroot] DKMS install img-bxm-dkms/0.1.0-2 (build + install)"
+echo ">> [chroot] DKMS install img-bxm-dkms/${DKMS_VERSION} (build + install)"
 dkms add "/usr/src/${DKMS_SOURCE_NAME}" 2>&1 | tail -3 || true
-dkms install "img-bxm-dkms/${DKMS_VERSION}" -k \${OPI_KVER} 2>&1 | tail -15
+dkms install "img-bxm-dkms/${DKMS_VERSION}" -k \${OPI_KVER}
 
 echo ">> [chroot] dkms status:"
 dkms status
@@ -339,6 +360,19 @@ echo ">> [chroot] ldconfig"
 ldconfig
 ldconfig -p | grep -E "libsrv_um|libGLESv2_PVR|libVE\.so|libOmxCore" | head
 
+echo ">> [chroot] Verifying accelerator shared-library dependencies"
+shopt -s nullglob
+for library in /usr/local/lib/*.so* /usr/local/lib/dri/*.so \
+  /usr/lib/aarch64-linux-gnu/libOmx*.so* /usr/lib/libVIPhal.so /opt/yolov5/lib/*.so; do
+  [[ -f "\$library" && ! -L "\$library" ]] || continue
+  dependencies=\$(ldd "\$library")
+  if grep -F "not found" <<<"\$dependencies"; then
+    echo "ERROR: unresolved dependencies in \$library" >&2
+    exit 1
+  fi
+done
+shopt -u nullglob
+
 echo ">> [chroot] Verifying GStreamer registered the OMX plugin"
 gst-inspect-1.0 omxh264dec 2>&1 | grep -E "Hardware|Rank" | head
 
@@ -354,8 +388,6 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 CHROOT_EOF
 echo "==================== EXITED CHROOT ===================="
-
-cp /tmp/resolv.bak /mnt/out/etc/resolv.conf 2>/dev/null || true
 
 echo ""
 echo "Sync filesystem"

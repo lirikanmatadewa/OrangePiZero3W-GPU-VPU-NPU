@@ -34,6 +34,19 @@ OPI_PART_OFFSET=$((OPI_START * 512))
 
 LOOP=
 OPI_LOOP=
+NPU_LOOP=
+cleanup() {
+  umount -l /mnt/radxa 2>/dev/null || true
+  umount -l /mnt/opi 2>/dev/null || true
+  [ -z "$LOOP" ] || losetup -d "$LOOP" 2>/dev/null || true
+  [ -z "$OPI_LOOP" ] || losetup -d "$OPI_LOOP" 2>/dev/null || true
+  if [[ -n "$NPU_LOOP" ]]; then
+    umount /mnt/npu 2>/dev/null || true
+    losetup -d "$NPU_LOOP" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
 LOOP=$(losetup -o $RADXA_PART_OFFSET --sizelimit $RADXA_PART_SIZE -f --show "$RADXA_IMG")
 OPI_LOOP=$(losetup -o $OPI_PART_OFFSET -f --show "$OPI_IMG")
 
@@ -44,18 +57,12 @@ mount -o ro "$OPI_LOOP" /mnt/opi
 
 RADXA_INFO=/mnt/radxa/var/lib/dpkg/info
 
-cleanup() {
-  umount -l /mnt/radxa 2>/dev/null || true
-  umount -l /mnt/opi 2>/dev/null || true
-  [ -z "$LOOP" ] || losetup -d "$LOOP" 2>/dev/null || true
-  [ -z "$OPI_LOOP" ] || losetup -d "$OPI_LOOP" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-if ! grep -Eiq '^ID="?debian"?$' /mnt/opi/etc/os-release; then
-  echo "ERROR: selected Orange Pi image is not Debian: $OPI_IMG" >&2
+if ! is_debian_compatible /mnt/opi/etc/os-release; then
+  echo "ERROR: selected Orange Pi image is not Debian-compatible: $OPI_IMG" >&2
   exit 1
 fi
+
+prepare_npu_source /mnt/opi
 
 # pvr-userspace.tar.gz
 echo ">> Building pvr-userspace.tar.gz"
@@ -139,13 +146,7 @@ done
 # Valid flag names were taken from the plugin binary:
 #   strings /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstomx.so | \
 #     grep -E "^(no-|event-|signals-|pass-|height-)"
-GSTOMX_STAGED="$VPU_STAGE/etc/xdg/gstomx.conf"
-
-if [ -f "$GSTOMX_STAGED" ]; then
-  HACKS="event-port-settings-changed-ndata-parameter-swap;event-port-settings-changed-port-0-to-1;no-disable-outport;no-component-reconfigure;no-component-role;no-empty-eos-buffer;pass-color-format-to-decoder;pass-profile-to-decoder;signals-premature-eos;height-multiple-16"
-  sed -i "s|^hacks=.*|hacks=$HACKS|" "$GSTOMX_STAGED"
-  echo "   patched gstomx.conf: $(grep -c '^hacks=' "$GSTOMX_STAGED") entries"
-fi
+install_gstomx_config "$VPU_STAGE" /mnt/radxa
 
 # Make Cedar device nodes usable on headless boots
 mkdir -p "$VPU_STAGE/etc/udev/rules.d"
@@ -166,28 +167,8 @@ echo ">> Building npu-userspace.tar.gz"
 NPU_STAGE=/tmp/npu-stage
 rm -rf "$NPU_STAGE"; mkdir -p "$NPU_STAGE"
 
-# libVIPhal.so is the VIP/NPU userspace HAL. The YOLOv5 tree is the demo that
-# ships with the Orange Pi image. Keep this list deliberately small: it
-# mirrors the useful part of the manual extraction command and avoids copying
-# the source image's unrelated applications and development files.
-NPU_PATHS="
-/usr/lib/libVIPhal.so
-/opt/yolov5
-"
-NPU_COPIED=0
-for path in $NPU_PATHS; do
-  src="/mnt/opi$path"
-  if [ ! -e "$src" ] && [ ! -L "$src" ]; then
-    echo "ERROR: required NPU path is missing from Orange Pi image: $path" >&2
-    echo "       This image does not contain the expected VIP/YOLOv5 demo." >&2
-    exit 1
-  fi
-  mkdir -p "$NPU_STAGE$(dirname "$path")"
-  # Follow source-image symlinks so the standalone archive does not contain a
-  # link whose target was not included in this deliberately small bundle.
-  cp -aL "$src" "$NPU_STAGE$path"
-  NPU_COPIED=$((NPU_COPIED+1))
-done
+copy_npu_userspace "$NPU_STAGE"
+NPU_COPIED=${#NPU_PATHS[@]}
 
 rm -f /work/npu-userspace.tar.gz
 tar --dereference --xattrs --numeric-owner -C "$NPU_STAGE" \

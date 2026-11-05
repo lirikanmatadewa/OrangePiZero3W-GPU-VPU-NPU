@@ -22,6 +22,7 @@ exec docker run --rm --privileged \
   -e IMAGE_CONFIG_FILE=/repo/.env \
   -e OPI_IMAGE="$OPI_IMAGE" \
   -e RADXA_IMAGE="$RADXA_IMAGE" \
+  -e NPU_IMAGE="${NPU_IMAGE:-}" \
   -w /work \
   debian:bookworm-slim \
   bash -c 'apt-get update && apt-get install -y util-linux && exec bash /repo/scripts/make-tarball.sh'
